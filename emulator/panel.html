@@ -1,0 +1,255 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Эмулятор GREEN-API</title>
+    <style>
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font: 14px/1.4 'Segoe UI', system-ui, -apple-system, Roboto, sans-serif;
+        color: #1a1c22;
+        background: #f1f3f7;
+      }
+      header {
+        display: flex;
+        align-items: center;
+        gap: 16px;
+        padding: 12px 20px;
+        background: #fff;
+        border-bottom: 1px solid #e4e7ee;
+      }
+      header h1 { margin: 0; font-size: 16px; }
+      header select { padding: 6px 8px; border: 1px solid #e4e7ee; border-radius: 8px; font: inherit; }
+      header .meta { color: #7b808c; margin-left: auto; }
+      main { display: grid; grid-template-columns: 320px 1fr; height: calc(100vh - 49px); }
+      aside { display: flex; flex-direction: column; background: #fff; border-right: 1px solid #e4e7ee; }
+      #contacts { flex: 1; overflow-y: auto; margin: 0; padding: 0; list-style: none; }
+      #contacts li { padding: 10px 16px; cursor: pointer; border-bottom: 1px solid #f1f3f7; }
+      #contacts li:hover { background: #f4f6fa; }
+      #contacts li.active { background: #e8f0ff; }
+      #contacts .name { font-weight: 600; }
+      #contacts .sub { color: #7b808c; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      form { display: flex; gap: 8px; padding: 12px; border-top: 1px solid #e4e7ee; }
+      #add-contact { flex-direction: column; }
+      input, textarea {
+        flex: 1;
+        padding: 8px 10px;
+        border: 1px solid #e4e7ee;
+        border-radius: 8px;
+        font: inherit;
+        resize: none;
+      }
+      button {
+        padding: 8px 14px;
+        border: 0;
+        border-radius: 8px;
+        background: #2f6bff;
+        color: #fff;
+        font: inherit;
+        cursor: pointer;
+      }
+      button:disabled { opacity: 0.5; cursor: default; }
+      section { display: flex; flex-direction: column; min-height: 0; }
+      #chat-title { padding: 12px 20px; background: #fff; border-bottom: 1px solid #e4e7ee; font-weight: 600; }
+      #messages { flex: 1; overflow-y: auto; padding: 16px 20px; background: #e8edf5; }
+      .msg { max-width: 60%; margin: 4px 0; padding: 6px 10px; border-radius: 12px; background: #fff; white-space: pre-wrap; }
+      .msg.from-contact { margin-right: auto; }
+      .msg.from-app { margin-left: auto; background: #d9e6ff; }
+      .msg .time { margin-left: 8px; color: #7b808c; font-size: 11px; }
+      .hint { color: #7b808c; padding: 16px 20px; }
+      #error { color: #e5484d; padding: 0 12px 8px; min-height: 1em; font-size: 12px; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Эмулятор GREEN-API</h1>
+      <label>Инстанс <select id="instance"></select></label>
+      <label><input type="checkbox" id="auto-reply" /> Автоответ контакта</label>
+      <span class="meta" id="queue"></span>
+    </header>
+    <main>
+      <aside>
+        <ul id="contacts"></ul>
+        <form id="add-contact">
+          <input id="contact-phone" placeholder="Телефон, например 79991234567" required />
+          <input id="contact-name" placeholder="Имя (необязательно)" />
+          <button type="submit">Добавить контакт</button>
+        </form>
+        <div id="error"></div>
+      </aside>
+      <section>
+        <div id="chat-title">Выберите контакт</div>
+        <div id="messages"><div class="hint">Сообщения, которые контакт напишет здесь, придут в приложение как входящие.</div></div>
+        <form id="send">
+          <textarea id="text" rows="2" placeholder="Сообщение от имени контакта (Enter — отправить)" disabled></textarea>
+          <button type="submit" id="send-button" disabled>Отправить в приложение</button>
+        </form>
+      </section>
+    </main>
+
+    <script>
+      const STATUS_ICONS = { sent: '✓', delivered: '✓✓', read: '✓✓ прочитано' };
+      let snapshot = { contacts: [], autoReply: true, queueSize: 0, instances: [], instance: null };
+      /** Инстанс, выбранный вручную; пока не выбран, панель показывает тот, с которым последним работало приложение. */
+      let selectedInstance = null;
+      let selectedId = null;
+      let lastRenderedKey = '';
+      let lastContactsKey = '';
+
+      const $ = (id) => document.getElementById(id);
+      const escape = (text) =>
+        text.replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]);
+      const time = (sec) => new Date(sec * 1000).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
+
+      async function api(method, path, body) {
+        const response = await fetch(path, {
+          method,
+          headers: body ? { 'Content-Type': 'application/json' } : undefined,
+          body: body ? JSON.stringify(body) : undefined,
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.message);
+        return data;
+      }
+
+      const setText = (element, text) => {
+        if (element.textContent !== text) element.textContent = text;
+      };
+
+      /** Перерисовка узла сбрасывает выделение в нём, поэтому во время выделения текста узел не трогаем. */
+      const hasSelectionIn = (element) => {
+        const selection = window.getSelection();
+        return Boolean(selection && !selection.isCollapsed && element.contains(selection.anchorNode));
+      };
+
+      function render() {
+        $('auto-reply').checked = snapshot.autoReply;
+        setText($('queue'), `Уведомлений в очереди: ${snapshot.queueSize}`);
+
+        const instanceOptions = snapshot.instances.length
+          ? snapshot.instances.map((id) => `<option value="${escape(id)}">${escape(id)}</option>`).join('')
+          : '<option value="">нет — войдите в приложение</option>';
+        if ($('instance').dataset.options !== instanceOptions) {
+          $('instance').dataset.options = instanceOptions;
+          $('instance').innerHTML = instanceOptions;
+        }
+        $('instance').value = snapshot.instance ?? '';
+        $('instance').disabled = !snapshot.instances.length;
+
+        const contactsKey = selectedId + JSON.stringify(snapshot.contacts);
+        if (contactsKey !== lastContactsKey && !hasSelectionIn($('contacts'))) {
+          lastContactsKey = contactsKey;
+          $('contacts').innerHTML = snapshot.contacts
+            .map((contact) => {
+              const last = contact.messages[contact.messages.length - 1];
+              return `<li data-id="${contact.chatId}" class="${contact.chatId === selectedId ? 'active' : ''}">
+                <div class="name">${escape(contact.name)}</div>
+                <div class="sub">+${contact.phone} · chatId ${contact.chatId}</div>
+                <div class="sub">${last ? escape(last.textMessage ?? '') : 'Нет сообщений'}</div>
+              </li>`;
+            })
+            .join('');
+        }
+
+        const contact = snapshot.contacts.find((item) => item.chatId === selectedId);
+        $('text').disabled = $('send-button').disabled = !contact;
+        if (!contact) return;
+
+        setText($('chat-title'), `${contact.name} · +${contact.phone}`);
+        const key = contact.chatId + JSON.stringify(contact.messages);
+        if (key === lastRenderedKey || hasSelectionIn($('messages'))) return;
+        lastRenderedKey = key;
+
+        const box = $('messages');
+        const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
+        box.innerHTML =
+          contact.messages
+            .map((message) => {
+              const fromContact = message.type === 'incoming';
+              const status = fromContact ? '' : ` ${STATUS_ICONS[message.statusMessage] ?? message.statusMessage ?? ''}`;
+              return `<div class="msg ${fromContact ? 'from-contact' : 'from-app'}">${escape(message.textMessage ?? '')}<span class="time">${time(message.timestamp)}${status}</span></div>`;
+            })
+            .join('') || '<div class="hint">Переписки пока нет</div>';
+        if (atBottom) box.scrollTop = box.scrollHeight;
+      }
+
+      async function refresh() {
+        try {
+          const query = selectedInstance ? `?instance=${encodeURIComponent(selectedInstance)}` : '';
+          const previousInstance = snapshot.instance;
+          snapshot = await api('GET', `/emulator/state${query}`);
+          if (snapshot.instance !== previousInstance) {
+            selectedId = null;
+            lastRenderedKey = '';
+          }
+          if (!selectedId && snapshot.contacts.length) selectedId = snapshot.contacts[0].chatId;
+          render();
+        } catch {
+          $('queue').textContent = 'Эмулятор недоступен';
+        }
+      }
+
+      $('contacts').addEventListener('click', (event) => {
+        const item = event.target.closest('li');
+        if (!item || hasSelectionIn(item)) return;
+        selectedId = item.dataset.id;
+        lastRenderedKey = '';
+        render();
+        $('messages').scrollTop = $('messages').scrollHeight;
+        $('text').focus();
+      });
+
+      $('instance').addEventListener('change', (event) => {
+        selectedInstance = event.target.value || null;
+        void refresh();
+      });
+
+      $('auto-reply').addEventListener('change', (event) => {
+        void api('POST', '/emulator/settings', { autoReply: event.target.checked }).then(refresh);
+      });
+
+      $('add-contact').addEventListener('submit', async (event) => {
+        event.preventDefault();
+        $('error').textContent = '';
+        try {
+          const contact = await api('POST', '/emulator/contacts', {
+            instance: snapshot.instance,
+            phone: $('contact-phone').value,
+            name: $('contact-name').value,
+          });
+          selectedId = contact.chatId;
+          event.target.reset();
+          await refresh();
+        } catch (error) {
+          $('error').textContent = error.message;
+        }
+      });
+
+      async function sendAsContact() {
+        const text = $('text').value.trim();
+        if (!text || !selectedId) return;
+        $('text').value = '';
+        await api('POST', '/emulator/incoming', { instance: snapshot.instance, chatId: selectedId, text });
+        await refresh();
+        $('messages').scrollTop = $('messages').scrollHeight;
+      }
+
+      $('send').addEventListener('submit', (event) => {
+        event.preventDefault();
+        void sendAsContact();
+      });
+
+      $('text').addEventListener('keydown', (event) => {
+        if (event.key === 'Enter' && !event.shiftKey) {
+          event.preventDefault();
+          void sendAsContact();
+        }
+      });
+
+      void refresh();
+      setInterval(refresh, 1000);
+    </script>
+  </body>
+</html>
